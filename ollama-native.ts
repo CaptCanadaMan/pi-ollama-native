@@ -31,6 +31,7 @@
 // request at a given num_ctx triggers a one-time model reload (~5–10s);
 // subsequent requests at the same value are cached.
 
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { calculateCost } from "../models.js";
 import type {
 	AssistantMessage,
@@ -149,6 +150,81 @@ const DEFAULT_KEEP_ALIVE = "5m";
 const DEFAULT_BASE_URL = "http://localhost:11434";
 
 // ============================================================================
+// Debug logging — set OLLAMA_NATIVE_DEBUG=1 to dump raw NDJSON chunks to
+// stderr. Set OLLAMA_NATIVE_DUMP_DIR=/path/to/dir to write each full request
+// body and raw response stream to that directory (one paired req/res file per
+// request) for replay against curl during diagnostics.
+// ============================================================================
+
+const OLLAMA_DEBUG = process.env.OLLAMA_NATIVE_DEBUG === "1";
+const OLLAMA_DUMP_DIR = process.env.OLLAMA_NATIVE_DUMP_DIR;
+
+let dumpCounter = 0;
+
+function dbg(label: string, data: unknown): void {
+	if (!OLLAMA_DEBUG) return;
+	const payload = typeof data === "string" ? data : JSON.stringify(data);
+	process.stderr.write(`[ollama-native:${label}] ${payload}\n`);
+}
+
+// Returns a unique prefix (timestamp + counter) used to pair the request file
+// with its response file, e.g. req-{prefix}.json + res-{prefix}.ndjson. The
+// timestamp prefix isolates dumps across restarts; the counter disambiguates
+// requests within the same millisecond.
+function dumpRequest(body: object): string | null {
+	if (!OLLAMA_DUMP_DIR) return null;
+	try {
+		const n = ++dumpCounter;
+		const ts = new Date().toISOString().replace(/[:.]/g, "-");
+		const prefix = `${ts}-${n}`;
+		mkdirSync(OLLAMA_DUMP_DIR, { recursive: true });
+		writeFileSync(`${OLLAMA_DUMP_DIR}/req-${prefix}.json`, JSON.stringify(body, null, 2));
+		return prefix;
+	} catch (e) {
+		process.stderr.write(`[ollama-native:dump-error] ${String(e)}\n`);
+		return null;
+	}
+}
+
+function dumpResponseLine(prefix: string | null, line: string): void {
+	if (!OLLAMA_DUMP_DIR || prefix === null) return;
+	try {
+		appendFileSync(`${OLLAMA_DUMP_DIR}/res-${prefix}.ndjson`, line + "\n");
+	} catch {
+		// Swallow — dump failures shouldn't kill the stream.
+	}
+}
+
+// ============================================================================
+// Ghost-token retry — Ollama occasionally generates output tokens but streams
+// nothing visible (empty content, no thinking, no tool_calls), typically after
+// many tool-call rounds with growing context. The signature is a single chunk
+// with done:true and eval_count > 0 but an empty or missing message. Stochastic
+// in observed cases; retrying the same request usually clears it. Set
+// OLLAMA_NATIVE_GHOST_RETRIES=N (default 2) to control how many retries to
+// attempt before surfacing the failure as an error.
+// ============================================================================
+
+const MAX_GHOST_RETRIES = (() => {
+	const raw = process.env.OLLAMA_NATIVE_GHOST_RETRIES;
+	if (!raw) return 2;
+	const n = parseInt(raw, 10);
+	return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
+
+function isGhostChunk(chunk: OllamaChunk): boolean {
+	if (!chunk.done) return false;
+	if ((chunk.eval_count ?? 0) === 0) return false;
+	const m = chunk.message;
+	if (!m) return true;
+	const hasContent =
+		(m.content && m.content.length > 0) ||
+		(m.thinking && m.thinking.length > 0) ||
+		(m.tool_calls && m.tool_calls.length > 0);
+	return !hasContent;
+}
+
+// ============================================================================
 // Type guards
 // ============================================================================
 
@@ -220,21 +296,125 @@ export const streamOllamaNative: StreamFunction<"ollama-native", OllamaNativeOpt
 				...(options?.headers ?? {}),
 			};
 
-			const response = await fetch(url, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-				signal: options?.signal,
+			dbg("request", {
+				url,
+				model: body.model,
+				messages: body.messages.length,
+				tools: body.tools?.length ?? 0,
+				num_ctx: body.options?.num_ctx,
+				lastMessageRole: body.messages[body.messages.length - 1]?.role,
 			});
 
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			// Retry loop for ghost-token responses. We make the request, read the
+			// first complete NDJSON line, and check for the ghost signature. On
+			// detection we cancel the reader and retry. On healthy response we
+			// fall through with the first line still buffered, so the main
+			// streaming loop below processes it normally.
+			let dumpId: string | null = null;
+			let reader!: ReadableStreamDefaultReader<Uint8Array>;
+			let initialBuffer = "";
+			let ghostAttempts = 0;
+			const decoder = new TextDecoder();
 
-			if (!response.ok) {
-				const text = await response.text().catch(() => "");
-				throw new Error(`Ollama /api/chat returned HTTP ${response.status}: ${text.slice(0, 500)}`);
-			}
-			if (!response.body) {
-				throw new Error("Ollama /api/chat returned no response body");
+			while (true) {
+				dumpId = dumpRequest(body);
+
+				const response = await fetch(url, {
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+					signal: options?.signal,
+				});
+
+				await options?.onResponse?.(
+					{ status: response.status, headers: headersToRecord(response.headers) },
+					model,
+				);
+
+				dbg("response-status", { status: response.status, ok: response.ok, attempt: ghostAttempts });
+
+				if (!response.ok) {
+					const text = await response.text().catch(() => "");
+					throw new Error(`Ollama /api/chat returned HTTP ${response.status}: ${text.slice(0, 500)}`);
+				}
+				if (!response.body) {
+					throw new Error("Ollama /api/chat returned no response body");
+				}
+
+				reader = response.body.getReader();
+
+				// Read until we have at least one complete NDJSON line.
+				let buf = "";
+				let firstLine: string | null = null;
+				let streamEndedEarly = false;
+				while (firstLine === null) {
+					const { value, done: streamDone } = await reader.read();
+					if (streamDone) {
+						streamEndedEarly = true;
+						break;
+					}
+					buf += decoder.decode(value, { stream: true });
+					const nl = buf.indexOf("\n");
+					if (nl !== -1) {
+						firstLine = buf.slice(0, nl).trim();
+						buf = buf.slice(nl + 1);
+						if (!firstLine) {
+							// Empty line — keep looking
+							firstLine = null;
+						}
+					}
+				}
+
+				if (streamEndedEarly || firstLine === null) {
+					// Stream ended without producing anything parseable. Treat as a
+					// degenerate normal completion; fall through and let the main loop
+					// observe the empty stream.
+					initialBuffer = buf;
+					break;
+				}
+
+				// Try to parse the first line. If it's malformed, just fall through
+				// and let the main loop's parser handle it (it tolerates malformed
+				// lines by skipping them).
+				let firstChunk: OllamaChunk | null = null;
+				try {
+					firstChunk = JSON.parse(firstLine) as OllamaChunk;
+				} catch {
+					firstChunk = null;
+				}
+
+				if (firstChunk && isGhostChunk(firstChunk)) {
+					dbg("ghost-detected", {
+						attempt: ghostAttempts,
+						evalCount: firstChunk.eval_count,
+						maxRetries: MAX_GHOST_RETRIES,
+					});
+					// Log + dump the discarded ghost chunk so logs reflect what
+					// Ollama actually sent on this attempt.
+					dbg("chunk", firstLine);
+					dumpResponseLine(dumpId, firstLine);
+
+					// Cancel the reader to free the connection.
+					await reader.cancel().catch(() => undefined);
+
+					ghostAttempts++;
+					if (ghostAttempts > MAX_GHOST_RETRIES) {
+						throw new Error(
+							`Ollama returned ghost tokens (${firstChunk.eval_count} evaluated, none streamed) ` +
+								`after ${MAX_GHOST_RETRIES + 1} attempt(s). This is an Ollama-side reliability ` +
+								`issue: tokens are generated internally but the streamed response contains no ` +
+								`content, thinking, or tool calls. Set OLLAMA_NATIVE_GHOST_RETRIES=N to increase tolerance.`,
+						);
+					}
+					// Retry the request from scratch.
+					continue;
+				}
+
+				// Healthy response — put the first line back at the front of the
+				// buffer so the main loop processes it (with logging/dumping)
+				// alongside any subsequent chunks.
+				initialBuffer = `${firstLine}\n${buf}`;
+				break;
 			}
 
 			stream.push({ type: "start", partial: output });
@@ -269,16 +449,17 @@ export const streamOllamaNative: StreamFunction<"ollama-native", OllamaNativeOpt
 				}
 			};
 
-			const reader = response.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
+			let buffer = initialBuffer;
 			let sawToolCalls = false;
+			let sawDoneChunk = false;
+			let chunksReceived = 0;
+			let streamDoneFlag = false;
 
 			outer: while (true) {
-				const { value, done: streamDone } = await reader.read();
-				if (streamDone) break;
-				buffer += decoder.decode(value, { stream: true });
-
+				// Drain any complete lines already in the buffer first. This
+				// matters for the retry path which seeds the buffer with the
+				// first line before this loop runs, and also for the case where
+				// reader.read() returned multiple chunks at once.
 				while (true) {
 					const nl = buffer.indexOf("\n");
 					if (nl === -1) break;
@@ -286,10 +467,15 @@ export const streamOllamaNative: StreamFunction<"ollama-native", OllamaNativeOpt
 					buffer = buffer.slice(nl + 1);
 					if (!line) continue;
 
+					chunksReceived++;
+					dbg("chunk", line);
+					dumpResponseLine(dumpId, line);
+
 					let chunk: OllamaChunk;
 					try {
 						chunk = JSON.parse(line) as OllamaChunk;
-					} catch {
+					} catch (e) {
+						dbg("parse-error", { line, error: String(e) });
 						// Malformed NDJSON line — should never happen with /api/chat in
 						// practice, but don't kill the stream over a single bad line.
 						continue;
@@ -407,6 +593,7 @@ export const streamOllamaNative: StreamFunction<"ollama-native", OllamaNativeOpt
 
 					// Final chunk — populate usage and stop reason, then exit both loops.
 					if (chunk.done) {
+						sawDoneChunk = true;
 						finishCurrentBlock(currentBlock);
 						currentBlock = null;
 
@@ -433,10 +620,32 @@ export const streamOllamaNative: StreamFunction<"ollama-native", OllamaNativeOpt
 						break outer;
 					}
 				}
+
+				// Buffer drained. If the stream has already ended, exit. Otherwise
+				// read more from the network and append to the buffer for the next
+				// drain pass.
+				if (streamDoneFlag) break;
+				const { value, done: streamDone } = await reader.read();
+				if (streamDone) {
+					dbg("stream-end", { reason: "reader-done", buffered: buffer.length });
+					streamDoneFlag = true;
+					continue;
+				}
+				buffer += decoder.decode(value, { stream: true });
 			}
 
 			// Defensive cleanup if the stream ended without a done chunk.
 			finishCurrentBlock(currentBlock);
+
+			dbg("done", {
+				stopReason: output.stopReason,
+				sawToolCalls,
+				chunksReceived,
+				contentBlocks: output.content.length,
+				blockTypes: output.content.map((b) => b.type),
+				inputTokens: output.usage.input,
+				outputTokens: output.usage.output,
+			});
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -445,11 +654,51 @@ export const streamOllamaNative: StreamFunction<"ollama-native", OllamaNativeOpt
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 
+			// Truncation detection — the underlying connection closed before Ollama
+			// emitted a `done: true` terminator chunk. We received valid streaming
+			// output (thinking/text/tool deltas) but never the completion marker.
+			// Different fingerprint from ghost tokens (which produce only the done
+			// chunk with no content); shares a likely root cause (Ollama's tool
+			// call generation path failing). We can't safely auto-retry because
+			// partial events have already been emitted to the consumer; surfacing
+			// as an error makes the failure visible so the user can retry the turn.
+			if (!sawDoneChunk && chunksReceived > 0) {
+				dbg("truncated", { chunksReceived, blockTypes: output.content.map((b) => b.type) });
+				throw new Error(
+					`Ollama stream truncated mid-response: received ${chunksReceived} chunk(s) of ` +
+						`${output.content.map((b) => b.type).join("+") || "no"} content, but the connection ` +
+						`closed before any chunk with done:true was emitted. This is an Ollama-side reliability ` +
+						`issue, often triggered when the model attempts to generate a tool call. Retry the turn.`,
+				);
+			}
+
+			// Ghost-token detection — Ollama generated output but never streamed it.
+			// Symptom: eval_count > 0 yet no text, thinking, or tool calls landed in
+			// the stream. This typically happens when the model emits a malformed
+			// tool call that Ollama's parser silently swallows. The agent loop above
+			// would otherwise treat this as a clean "stop" and end the turn — making
+			// it a silent failure. Surfacing as an error makes the failure loud.
+			const hasMeaningfulContent = output.content.some(
+				(b) =>
+					(b.type === "text" && b.text.trim().length > 0) ||
+					(b.type === "thinking" && b.thinking.trim().length > 0) ||
+					b.type === "toolCall",
+			);
+			if (output.usage.output > 0 && !hasMeaningfulContent) {
+				dbg("ghost-tokens", { evalCount: output.usage.output, chunksReceived });
+				throw new Error(
+					`Ollama generated ${output.usage.output} output tokens but streamed no visible content, thinking, or tool calls. ` +
+						`This is usually caused by a malformed tool call that Ollama's parser silently swallowed. ` +
+						`Retry the request or rephrase.`,
+				);
+			}
+
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			dbg("error", { stopReason: output.stopReason, message: output.errorMessage });
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

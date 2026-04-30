@@ -29,6 +29,16 @@ A single provider file that translates Pi's streaming protocol to Ollama's nativ
 
 ---
 
+## Environment Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OLLAMA_NATIVE_DEBUG` | unset | Set to `1` to log every NDJSON chunk to stderr |
+| `OLLAMA_NATIVE_DUMP_DIR` | unset | Path to write paired `req-*.json` / `res-*.ndjson` files per request for replay diagnostics |
+| `OLLAMA_NATIVE_GHOST_RETRIES` | `2` | Max retries on a ghost-token response before surfacing an error |
+
+---
+
 ## Verified Models
 
 These models are confirmed tool-capable via Ollama's native API:
@@ -105,6 +115,8 @@ Key design decisions documented in the file header, but briefly:
 - Tool calls emitted as a complete burst — Ollama delivers them as parsed objects in one chunk, not as streaming JSON fragments
 - `sawToolCalls` flag — Ollama always returns `done_reason: "stop"` even on tool-call turns; the flag disambiguates
 - Thinking blocks handled separately — Gemma 4 emits reasoning in `message.thinking`, not `<think>` tags; dropped on replay
+- Ghost-token retry — Ollama occasionally generates output tokens but streams nothing visible, typically after many tool-call rounds with growing context. The provider detects the signature (`done:true`, `eval_count > 0`, empty message) on the first NDJSON line and retries up to `OLLAMA_NATIVE_GHOST_RETRIES` times (default: 2)
+- Truncation detection — if the connection closes before a `done:true` chunk arrives, the provider surfaces a clear error rather than silently accepting partial output. Cannot auto-retry since partial events have already been emitted; retry the turn manually
 
 ### 3 — Register as a builtin
 
