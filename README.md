@@ -1,5 +1,14 @@
 # pi-ollama-native
 
+> [!IMPORTANT]
+> **This repository is superseded by [`CaptCanadaMan/pi-ollama`](https://github.com/CaptCanadaMan/pi-ollama).**
+>
+> This repo documents the original *fork-based* approach — patching pi-mono's core to add a native `ollama-native` API type. It was the prototype that catalysed the work, built while figuring out how to make pi's agent loop survive Ollama's streaming tool-call bug ([ollama#12557](https://github.com/ollama/ollama/issues/12557)).
+>
+> The same goal is now achieved as a pi extension — no core patches required, just `pi install npm:pi-ollama`. That's the approach pi's design philosophy actually recommends (lean core, provider-specific logic in extensions). The architectural pivot was prompted by [a design document from v2nic](https://github.com/badlogic/pi-mono/issues/3357) on the pi-mono side, recommending extension-first over core PR.
+>
+> **For new installs, use [`pi-ollama`](https://github.com/CaptCanadaMan/pi-ollama). This repo stays online for historical reference.**
+
 A native Ollama provider for [pi-mono](https://github.com/mariozechner/pi-mono) that fixes tool calling under streaming.
 
 ---
